@@ -14,10 +14,12 @@ venv/
 # Logs
 *.log
 
-# Incubator data & artifacts (regenerable)
-data/
-reports/
-models/
+# Incubator data & artifacts (regenerable) — anchored to the repo root so these do NOT
+# also match the source packages src/qhfi/data/ and src/qhfi/models/ (which were silently
+# excluded from the initial public release by the unanchored patterns).
+/data/
+/reports/
+/models/
 *.sqlite
 *.duckdb
 
