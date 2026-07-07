@@ -126,6 +126,10 @@ class BarraRiskModel:
         min_names: int = 10,
     ) -> BarraRiskModel:
         """Convenience: build exposures from ``MarketPanels`` and fit in one call."""
+        if panels.close is None or panels.close.empty:
+            # Fail with an actionable message — an empty panel otherwise dies deep inside pandas
+            # ("no types given" from quantile on a zero-column frame).
+            raise ValueError("empty market panels — no bars in the store for this universe")
         exposures = style_exposures(panels)
         industries = industry_dummies(universe)
         model = cls(factor_halflife, specific_halflife, min_names)
