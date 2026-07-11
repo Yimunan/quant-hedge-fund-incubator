@@ -16,9 +16,20 @@ from __future__ import annotations
 import json
 from typing import Any
 
+import httpx
+
 from qhfi.api.client import ManagedHttpClient
 from qhfi.api.registry import ApiRegistry
 from qhfi.core.config import Settings, get_settings
+
+
+def _parse_json(text: str) -> dict:
+    """json.loads with markdown code fences stripped — some models fence even 'JSON only' output."""
+    t = (text or "").strip()
+    if t.startswith("```"):
+        t = t.split("\n", 1)[1] if "\n" in t else t.lstrip("`")
+        t = t.rsplit("```", 1)[0].strip()
+    return json.loads(t)
 
 
 class LLMClient:
@@ -29,6 +40,10 @@ class LLMClient:
     def __init__(self, settings: Settings | None = None, http: ManagedHttpClient | None = None) -> None:
         self.s = settings or get_settings()
         self.http = http or ApiRegistry(self.s).client("llm")
+        # None = unprobed; set once from the first structured() call. Remembering the answer
+        # matters: a 4xx counts as a circuit-breaker failure, so re-probing an unsupported
+        # provider every call would open the breaker after failure_threshold calls.
+        self._json_schema_ok: bool | None = None
 
     def complete(self, system: str, user: str, model: str | None = None, **kw: Any) -> str:
         """Single chat completion against the proxy → assistant text.
@@ -45,14 +60,44 @@ class LLMClient:
         return data["choices"][0]["message"]["content"]
 
     def structured(self, system: str, user: str, schema: dict, model: str | None = None) -> dict:
-        """Completion constrained to a JSON schema via response_format → parsed dict."""
+        """Completion constrained to a JSON schema → parsed dict.
+
+        Providers implementing OpenAI's ``json_schema`` response_format (vLLM proxy) get true
+        constrained decoding. Providers that 400 on it (DeepSeek: "This response_format type is
+        unavailable now") fall back to their ``json_object`` mode with the schema embedded in the
+        system prompt; the capability is remembered per client so only the first call pays the
+        probe. Non-400 errors (auth, rate limit, 5xx) propagate unchanged.
+        """
+        mdl = model or self.s.llm_model
+        if self._json_schema_ok is not False:
+            payload = {
+                "model": mdl,
+                "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+                "response_format": {"type": "json_schema", "json_schema": {"name": "out", "schema": schema}},
+            }
+            try:
+                data = self.http.post("/chat/completions", json=payload)
+                self._json_schema_ok = True
+                return _parse_json(data["choices"][0]["message"]["content"])
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code != 400:
+                    raise
+                self._json_schema_ok = False
+        # json_object fallback: schema rides in the prompt instead of the decoder. "JSON" must
+        # appear in the messages or DeepSeek/OpenAI reject json_object mode outright.
         payload = {
-            "model": model or self.s.llm_model,
-            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-            "response_format": {"type": "json_schema", "json_schema": {"name": "out", "schema": schema}},
+            "model": mdl,
+            "messages": [
+                {"role": "system", "content": (
+                    f"{system}\n\nRespond with a single JSON object — no prose, no code fences — "
+                    f"that validates against this JSON Schema:\n{json.dumps(schema)}"
+                )},
+                {"role": "user", "content": user},
+            ],
+            "response_format": {"type": "json_object"},
         }
         data = self.http.post("/chat/completions", json=payload)
-        return json.loads(data["choices"][0]["message"]["content"])
+        return _parse_json(data["choices"][0]["message"]["content"])
 
 
 class LangGraphBridge:
