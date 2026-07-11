@@ -5,12 +5,14 @@ MockTransport), the registry, and the LLMClient wired on top. Offline + determin
 
 from __future__ import annotations
 
+import json
+
 import httpx
 import pytest
 
 from qhfi.api.breaker import CircuitBreaker, CircuitOpenError
 from qhfi.api.cache import TTLCache
-from qhfi.api.client import ManagedClient, ManagedHttpClient, ServerError
+from qhfi.api.client import _HTTP_RETRY, ManagedClient, ManagedHttpClient, ServerError
 from qhfi.api.ratelimit import RateLimiter
 from qhfi.api.registry import ApiRegistry
 from qhfi.research.client import LLMClient
@@ -161,3 +163,39 @@ def test_llmclient_complete_and_structured_via_mock():
     client = LLMClient(http=http)
     assert client.complete("sys", "user") == '{"title": "hi"}'
     assert client.structured("sys", "user", schema={"type": "object"}) == {"title": "hi"}
+
+
+def test_llmclient_structured_falls_back_to_json_object():
+    """Providers that 400 on json_schema (DeepSeek) → json_object fallback, probed exactly once.
+
+    The probe must be remembered per client: every 4xx counts as a circuit-breaker failure, so
+    re-probing on each call would open the breaker after failure_threshold structured() calls.
+    """
+    state = {"schema": 0, "object": 0}
+
+    def handler(request):
+        body = json.loads(request.content)
+        if (body.get("response_format") or {}).get("type") == "json_schema":
+            state["schema"] += 1
+            return httpx.Response(400, json={
+                "error": {"message": "This response_format type is unavailable now"}})
+        state["object"] += 1
+        assert "JSON Schema" in body["messages"][0]["content"]  # schema moved into the prompt
+        return httpx.Response(200, json={"choices": [{"message": {"content": '{"title": "fb"}'}}]})
+
+    http = ManagedHttpClient("http://x/v1", transport=httpx.MockTransport(handler),
+                             managed=ManagedClient(backoff_base=0.0, retry_on=_HTTP_RETRY))
+    client = LLMClient(http=http)
+    for _ in range(3):
+        assert client.structured("sys", "user", schema={"type": "object"}) == {"title": "fb"}
+    assert state == {"schema": 1, "object": 3}   # one probe total, never re-probed
+
+
+def test_llmclient_structured_propagates_non_400():
+    def handler(request):
+        return httpx.Response(401, json={"error": "bad key"})
+
+    http = ManagedHttpClient("http://x/v1", transport=httpx.MockTransport(handler),
+                             managed=ManagedClient(backoff_base=0.0, retry_on=_HTTP_RETRY))
+    with pytest.raises(httpx.HTTPStatusError):
+        LLMClient(http=http).structured("sys", "user", schema={"type": "object"})
